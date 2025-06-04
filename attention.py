@@ -19,8 +19,15 @@ class TemporalAxialAttention(nn.Module):
         dim_head: int,
         rotary_emb: RotaryEmbedding,
         is_causal: bool = True,
+        layer_idx: int | None = None,
+        streaming: bool = False,
+        cache_len: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
     ):
         super().__init__()
+        self.layer_idx = layer_idx
         self.inner_dim = dim_head * heads
         self.heads = heads
         self.head_dim = dim_head
@@ -30,26 +37,134 @@ class TemporalAxialAttention(nn.Module):
 
         self.rotary_emb = rotary_emb
         self.is_causal = is_causal
+        self.streaming = streaming
+        
+        self.cache_len = cache_len
+        self.batch_size = batch_size
+        self.height = height
+        self.width = width
+        
+        if self.streaming:
+            if self.cache_len is None:
+                raise ValueError(
+                    "max_cache_len must be provided when streaming is True."
+                )
+
+            self.cache_batch_dim = self.batch_size * self.height * self.width
+
+            self.register_buffer(
+                "cache_k",
+                torch.zeros(
+                    self.cache_batch_dim,
+                    self.heads,
+                    self.cache_len,
+                    self.head_dim,
+                ),
+                persistent=False
+            )
+
+            self.register_buffer(
+                "cache_v",
+                torch.zeros(
+                    self.cache_batch_dim,
+                    self.heads,
+                    self.cache_len,
+                    self.head_dim,
+                ),
+                persistent=False,
+            )
+
+            self.current_cache_idx: int = 0
+            self.total_tokens_processed: int = 0
+
+    def reset_cache(self):
+        """Resets the cache and counters for a new streaming sequence."""
+        if self.streaming:
+            self.current_cache_idx = 0
+            self.total_tokens_processed = 0
+            self.cache_k.zero_()
+            self.cache_v.zero_()
 
     def forward(self, x: torch.Tensor):
         B, T, H, W, D = x.shape
 
         q, k, v = self.to_qkv(x).chunk(3, dim=-1)
-
+        effective_bsz = B * H * W
+        _time_seq_dim_for_rope = 2
+        
         q = rearrange(q, "B T H W (h d) -> (B H W) h T d", h=self.heads)
         k = rearrange(k, "B T H W (h d) -> (B H W) h T d", h=self.heads)
         v = rearrange(v, "B T H W (h d) -> (B H W) h T d", h=self.heads)
+        
+        if self.streaming:
+            assert (
+                T_in == 1
+            ), "In streaming mode, TemporalAxialAttention expects input tensor with T_in=1 (one new frame)"
 
-        q = self.rotary_emb.rotate_queries_or_keys(q, self.rotary_emb.freqs)
-        k = self.rotary_emb.rotate_queries_or_keys(k, self.rotary_emb.freqs)
+            assert effective_bsz <= self.max_cache_batch_dim, (
+                f"Current effective batch size {effective_bsz} (B*H*W) exceeds "
+                f"pre-allocated max_cache_batch_dim {self.max_cache_batch_dim}. Call reset_cache() if dimensions changed "
+                f"or re-initialize with larger max values."
+            )
+            
+            q_rot = self.rotary_emb.rotate_queries_or_keys(
+                q,
+                freqs=self.rotary_emb.freqs,
+                seq_dim=_time_seq_dim_for_rope,
+                offset=self.total_tokens_processed,
+            )
+            
+            k_rot = self.rotary_emb.rotate_queries_or_keys(
+                k,
+                freqs=self.rotary_emb.freqs,
+                seq_dim=_time_seq_dim_for_rope,
+                offset=self.total_tokens_processed,
+            )
 
-        q, k, v = map(lambda t: t.contiguous(), (q, k, v))
+            self.cache_k[
+                :effective_bsz,
+                :,
+                self.current_cache_idx : self.current_cache_idx + 1,
+                :,
+            ] = k_rot.detach()
+            
+            self.cache_v[
+                :effective_bsz,
+                :,
+                self.current_cache_idx : self.current_cache_idx + 1,
+                :,
+            ] = v.detach()
 
-        x = F.scaled_dot_product_attention(query=q, key=k, value=v, is_causal=self.is_causal)
+            self.total_tokens_processed += 1
+            num_valid_in_cache = min(self.total_tokens_processed, self.cache_len)
 
+            if self.total_tokens_processed <= self.cache_len:
+                attn_k = self.cache_k[:effective_bsz, :, :num_valid_in_cache, :]
+                attn_v = self.cache_v[:effective_bsz, :, :num_valid_in_cache, :]
+            else:
+                attn_k = self.cache_k[:effective_bsz, :, :, :]
+                attn_v = self.cache_v[:effective_bsz, :, :, :]
+
+            x = F.scaled_dot_product_attention(
+                query=q_rot,
+                key=attn_k,
+                value=attn_v,
+                is_causal=False,  
+            )
+            
+            self.current_cache_idx = (self.current_cache_idx + 1) % self.max_cache_len
+        else:
+            q = self.rotary_emb.rotate_queries_or_keys(q, freqs=self.rotary_emb.freqs,
+                                                       seq_dim=_time_seq_dim_for_rope, offset=0)
+            k = self.rotary_emb.rotate_queries_or_keys(k, freqs=self.rotary_emb.freqs,
+                                                       seq_dim=_time_seq_dim_for_rope, offset=0)
+            q, k, v = map(lambda t: t.contiguous(), (q, k, v))
+            x = F.scaled_dot_product_attention(
+                query=q, key=k, value=v, is_causal=self.is_causal
+            )
+            
         x = rearrange(x, "(B H W) h T d -> B T H W (h d)", B=B, H=H, W=W)
         x = x.to(q.dtype)
-
         # linear proj
         x = self.to_out(x)
         return x
@@ -62,8 +177,10 @@ class SpatialAxialAttention(nn.Module):
         heads: int,
         dim_head: int,
         rotary_emb: RotaryEmbedding,
+        layer_idx: int | None = None,
     ):
         super().__init__()
+        self.layer_idx = layer_idx
         self.inner_dim = dim_head * heads
         self.heads = heads
         self.head_dim = dim_head

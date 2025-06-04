@@ -137,9 +137,18 @@ class SpatioTemporalDiTBlock(nn.Module):
         is_causal=True,
         spatial_rotary_emb: Optional[RotaryEmbedding] = None,
         temporal_rotary_emb: Optional[RotaryEmbedding] = None,
+        layer_idx: int | None = None,
+        streaming: bool = False,
+        cache_len: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        patch_grid_h: Optiona[int] = None,
+        patch_grid_w: Optional[int] = None,
     ):
         super().__init__()
+        self.layer_idx = layer_idx
         self.is_causal = is_causal
+        self.streaming = streaming
+        
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
 
@@ -149,6 +158,8 @@ class SpatioTemporalDiTBlock(nn.Module):
             heads=num_heads,
             dim_head=hidden_size // num_heads,
             rotary_emb=spatial_rotary_emb,
+            layer_idx=layer_idx,
+            streaming=streaming,
         )
         self.s_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.s_mlp = Mlp(
@@ -166,7 +177,14 @@ class SpatioTemporalDiTBlock(nn.Module):
             dim_head=hidden_size // num_heads,
             is_causal=is_causal,
             rotary_emb=temporal_rotary_emb,
+            layer_idx=layer_idx,
+            streaming=streaming,
+            cache_len=cache_len,
+            batch_size=batch_size,
+            height=patch_grid_h,
+            width=patch_grid_w,
         )
+        
         self.t_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.t_mlp = Mlp(
             in_features=hidden_size,
@@ -209,6 +227,7 @@ class DiT(nn.Module):
         mlp_ratio=4.0,
         external_cond_dim=25,
         max_frames=32,
+        streaming=False,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -216,15 +235,17 @@ class DiT(nn.Module):
         self.patch_size = patch_size
         self.num_heads = num_heads
         self.max_frames = max_frames
+        self.streaming = streaming
 
         self.x_embedder = PatchEmbed(input_h, input_w, patch_size, in_channels, hidden_size, flatten=False)
         self.t_embedder = TimestepEmbedder(hidden_size)
         frame_h, frame_w = self.x_embedder.grid_size
-
+        batch_size = 1
+        
         self.spatial_rotary_emb = RotaryEmbedding(dim=hidden_size // num_heads // 2, freqs_for="pixel", max_freq=256)
         self.temporal_rotary_emb = RotaryEmbedding(dim=hidden_size // num_heads)
         self.external_cond = nn.Linear(external_cond_dim, hidden_size) if external_cond_dim > 0 else nn.Identity()
-
+        
         self.blocks = nn.ModuleList(
             [
                 SpatioTemporalDiTBlock(
@@ -234,8 +255,14 @@ class DiT(nn.Module):
                     is_causal=True,
                     spatial_rotary_emb=self.spatial_rotary_emb,
                     temporal_rotary_emb=self.temporal_rotary_emb,
+                    layer_idx=i,
+                    streaming=streaming,
+                    batch_size=batch_size,
+                    cache_len=max_frames,
+                    patch_grid_h=frame_h,
+                    patch_grid_w=frame_w,
                 )
-                for _ in range(depth)
+                for i in range(depth)
             ]
         )
 
@@ -289,43 +316,51 @@ class DiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, w * p))
         return imgs
 
-    def forward(self, x, t, external_cond=None):
+    def forward(self, x, t, external_cond=None, last_only=False):
         """
         Forward pass of DiT.
         x: (B, T, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (B, T,) tensor of diffusion timesteps
         """
-
+        print(f"{t=}")
+        
         B, T, C, H, W = x.shape
-
+        
         # add spatial embeddings
         x = rearrange(x, "b t c h w -> (b t) c h w")
-        x = self.x_embedder(x)  # (B*T, C, H, W) -> (B*T, H/2, W/2, D) , C = 16, D = d_model
-        # restore shape
+        x = self.x_embedder(x)
         x = rearrange(x, "(b t) h w d -> b t h w d", t=T)
+        
         # embed noise steps
         t = rearrange(t, "b t -> (b t)")
-        c = self.t_embedder(t)  # (N, D)
+        c = self.t_embedder(t)
         c = rearrange(c, "(b t) d -> b t d", t=T)
         if torch.is_tensor(external_cond):
             c += self.external_cond(external_cond)
+        
         for block in self.blocks:
-            x = block(x, c)  # (N, T, H, W, D)
+            x = block(x, c)
+             
         x = self.final_layer(x, c)  # (N, T, H, W, patch_size ** 2 * out_channels)
+                    
         # unpatchify
         x = rearrange(x, "b t h w d -> (b t) h w d")
         x = self.unpatchify(x)  # (N, out_channels, H, W)
         x = rearrange(x, "(b t) c h w -> b t c h w", t=T)
 
+        if last_only:
+            x = x[:, -1:].contiguous()
+
         return x
 
 
-def DiT_S_2():
+def DiT_S_2(streaming: bool = False):
     return DiT(
         patch_size=2,
         hidden_size=1024,
         depth=16,
         num_heads=16,
+        streaming=streaming,
     )
 
 

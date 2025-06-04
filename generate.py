@@ -25,7 +25,7 @@ def main(args):
     torch.cuda.manual_seed(0)
 
     # load DiT checkpoint
-    model = DiT_models["DiT-S/2"]()
+    model = DiT_models["DiT-S/2"](streaming=True)
     print(f"loading Oasis-500M from oasis-ckpt={os.path.abspath(args.oasis_ckpt)}...")
     if args.oasis_ckpt.endswith(".pt"):
         ckpt = torch.load(args.oasis_ckpt, weights_only=True)
@@ -51,7 +51,7 @@ def main(args):
     ddim_noise_steps = args.ddim_steps
     noise_range = torch.linspace(-1, max_noise_level - 1, ddim_noise_steps + 1)
     noise_abs_max = 20
-    stabilization_level = 15
+    stabilization_level = 1
 
     # get prompt image/video
     x = load_prompt(
@@ -105,11 +105,16 @@ def main(args):
             t = t[:, start_frame:]
             t_next = t_next[:, start_frame:]
 
-            # get model predictions
+            # get model predictions (only last frame)
             with torch.no_grad():
                 with autocast("cuda", dtype=torch.half):
-                    v = model(x_curr, t, actions[:, start_frame : i + 1])
-
+                    v = model(
+                        x_curr,
+                        t,
+                        actions[:, start_frame : i + 1],
+                        last_only=True,   
+                    )
+                    
             x_start = alphas_cumprod[t].sqrt() * x_curr - (1 - alphas_cumprod[t]).sqrt() * v
             x_noise = ((1 / alphas_cumprod[t]).sqrt() * x_curr - x_start) / (1 / alphas_cumprod[t] - 1).sqrt()
 
@@ -118,7 +123,7 @@ def main(args):
             alpha_next[:, :-1] = torch.ones_like(alpha_next[:, :-1])
             if noise_idx == 1:
                 alpha_next[:, -1:] = torch.ones_like(alpha_next[:, -1:])
-            x_pred = alpha_next.sqrt() * x_start + x_noise * (1 - alpha_next).sqrt()
+            x_pred = alpha_next.sqrt() * x_start[:, -1:] + x_noise[:, -1:] * (1 - alpha_next).sqrt()
             x[:, -1:] = x_pred[:, -1:]
 
     # vae decoding
