@@ -47,7 +47,7 @@ class TemporalAxialAttention(nn.Module):
         if self.streaming:
             if self.cache_len is None:
                 raise ValueError(
-                    "max_cache_len must be provided when streaming is True."
+                    "cache_len must be provided when streaming is True."
                 )
 
             self.cache_batch_dim = self.batch_size * self.height * self.width
@@ -85,7 +85,7 @@ class TemporalAxialAttention(nn.Module):
             self.cache_k.zero_()
             self.cache_v.zero_()
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, last_frame: bool =False):
         B, T, H, W, D = x.shape
 
         q, k, v = self.to_qkv(x).chunk(3, dim=-1)
@@ -97,36 +97,32 @@ class TemporalAxialAttention(nn.Module):
         v = rearrange(v, "B T H W (h d) -> (B H W) h T d", h=self.heads)
         
         if self.streaming:
-            assert (
-                T_in == 1
-            ), "In streaming mode, TemporalAxialAttention expects input tensor with T_in=1 (one new frame)"
-
-            assert effective_bsz <= self.max_cache_batch_dim, (
+            assert effective_bsz <= self.cache_batch_dim, (
                 f"Current effective batch size {effective_bsz} (B*H*W) exceeds "
-                f"pre-allocated max_cache_batch_dim {self.max_cache_batch_dim}. Call reset_cache() if dimensions changed "
+                f"pre-allocated max_cache_batch_dim {self.cache_batch_dim}. Call reset_cache() if dimensions changed "
                 f"or re-initialize with larger max values."
             )
             
-            q_rot = self.rotary_emb.rotate_queries_or_keys(
+            q = self.rotary_emb.rotate_queries_or_keys(
                 q,
                 freqs=self.rotary_emb.freqs,
                 seq_dim=_time_seq_dim_for_rope,
                 offset=self.total_tokens_processed,
             )
             
-            k_rot = self.rotary_emb.rotate_queries_or_keys(
+            k = self.rotary_emb.rotate_queries_or_keys(
                 k,
                 freqs=self.rotary_emb.freqs,
                 seq_dim=_time_seq_dim_for_rope,
                 offset=self.total_tokens_processed,
             )
-
+            
             self.cache_k[
                 :effective_bsz,
                 :,
                 self.current_cache_idx : self.current_cache_idx + 1,
                 :,
-            ] = k_rot.detach()
+            ] = k.detach()
             
             self.cache_v[
                 :effective_bsz,
@@ -134,35 +130,27 @@ class TemporalAxialAttention(nn.Module):
                 self.current_cache_idx : self.current_cache_idx + 1,
                 :,
             ] = v.detach()
-
-            self.total_tokens_processed += 1
+            
             num_valid_in_cache = min(self.total_tokens_processed, self.cache_len)
 
-            if self.total_tokens_processed <= self.cache_len:
-                attn_k = self.cache_k[:effective_bsz, :, :num_valid_in_cache, :]
-                attn_v = self.cache_v[:effective_bsz, :, :num_valid_in_cache, :]
-            else:
-                attn_k = self.cache_k[:effective_bsz, :, :, :]
-                attn_v = self.cache_v[:effective_bsz, :, :, :]
-
-            x = F.scaled_dot_product_attention(
-                query=q_rot,
-                key=attn_k,
-                value=attn_v,
-                is_causal=False,  
-            )
+            k = self.cache_k[:, :, :num_valid_in_cache + 1, :]
+            v = self.cache_v[:, :, :num_valid_in_cache + 1, :]
             
-            self.current_cache_idx = (self.current_cache_idx + 1) % self.max_cache_len
+            if last_frame:
+                self.current_cache_idx = (self.current_cache_idx + 1) % self.cache_len
+                self.total_tokens_processed += 1
         else:
             q = self.rotary_emb.rotate_queries_or_keys(q, freqs=self.rotary_emb.freqs,
                                                        seq_dim=_time_seq_dim_for_rope, offset=0)
             k = self.rotary_emb.rotate_queries_or_keys(k, freqs=self.rotary_emb.freqs,
                                                        seq_dim=_time_seq_dim_for_rope, offset=0)
-            q, k, v = map(lambda t: t.contiguous(), (q, k, v))
-            x = F.scaled_dot_product_attention(
-                query=q, key=k, value=v, is_causal=self.is_causal
-            )
             
+        q, k, v = map(lambda t: t.contiguous(), (q, k, v))
+
+        x = F.scaled_dot_product_attention(
+            query=q, key=k, value=v, is_causal=self.is_causal and not self.streaming
+        )
+        
         x = rearrange(x, "(B H W) h T d -> B T H W (h d)", B=B, H=H, W=W)
         x = x.to(q.dtype)
         # linear proj

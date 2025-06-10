@@ -289,7 +289,10 @@ class RotaryEmbedding(Module):
     def forward(self, t: Tensor, freqs: Tensor, seq_len=None, offset=0):
         should_cache = self.cache_if_possible and not self.learned_freq and exists(seq_len) and self.freqs_for != "pixel" and (offset + seq_len) <= self.cache_max_seq_len
 
-        if should_cache and exists(self.cached_freqs) and (offset + seq_len) <= self.cached_freqs_seq_len.item():
+        comparison_val = torch.tensor(offset + seq_len, device=self.cached_freqs_seq_len.device)
+
+        # Now compare two tensors, which torch.compile can handle.
+        if should_cache and exists(self.cached_freqs) and torch.le(comparison_val, self.cached_freqs_seq_len):
             return self.cached_freqs[offset : (offset + seq_len)].detach()
 
         freqs = einsum("..., f -> ... f", t.type(freqs.dtype), freqs)
@@ -297,6 +300,13 @@ class RotaryEmbedding(Module):
 
         if should_cache and offset == 0:
             self.cached_freqs[:seq_len] = freqs.detach()
-            self.cached_freqs_seq_len.copy_(seq_len)
+
+            seq_len_tensor = torch.tensor(
+                seq_len, 
+                device=self.cached_freqs_seq_len.device, 
+                dtype=self.cached_freqs_seq_len.dtype
+            )
+            
+            self.cached_freqs_seq_len.copy_(seq_len_tensor)
 
         return freqs

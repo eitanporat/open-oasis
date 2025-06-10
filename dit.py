@@ -106,6 +106,7 @@ class TimestepEmbedder(nn.Module):
 
     def forward(self, t):
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_freq = t_freq.to(self.mlp[0].weight.dtype) 
         t_emb = self.mlp(t_freq)
         return t_emb
 
@@ -141,7 +142,7 @@ class SpatioTemporalDiTBlock(nn.Module):
         streaming: bool = False,
         cache_len: Optional[int] = None,
         batch_size: Optional[int] = None,
-        patch_grid_h: Optiona[int] = None,
+        patch_grid_h: Optional[int] = None,
         patch_grid_w: Optional[int] = None,
     ):
         super().__init__()
@@ -159,7 +160,6 @@ class SpatioTemporalDiTBlock(nn.Module):
             dim_head=hidden_size // num_heads,
             rotary_emb=spatial_rotary_emb,
             layer_idx=layer_idx,
-            streaming=streaming,
         )
         self.s_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.s_mlp = Mlp(
@@ -194,7 +194,7 @@ class SpatioTemporalDiTBlock(nn.Module):
         )
         self.t_adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True))
 
-    def forward(self, x, c):
+    def forward(self, x, c, last_frame=False):
         B, T, H, W, D = x.shape
 
         # spatial block
@@ -204,7 +204,7 @@ class SpatioTemporalDiTBlock(nn.Module):
 
         # temporal block
         t_shift_msa, t_scale_msa, t_gate_msa, t_shift_mlp, t_scale_mlp, t_gate_mlp = self.t_adaLN_modulation(c).chunk(6, dim=-1)
-        x = x + gate(self.t_attn(modulate(self.t_norm1(x), t_shift_msa, t_scale_msa)), t_gate_msa)
+        x = x + gate(self.t_attn(modulate(self.t_norm1(x), t_shift_msa, t_scale_msa), last_frame=last_frame), t_gate_msa)
         x = x + gate(self.t_mlp(modulate(self.t_norm2(x), t_shift_mlp, t_scale_mlp)), t_gate_mlp)
 
         return x
@@ -316,15 +316,13 @@ class DiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, w * p))
         return imgs
 
-    def forward(self, x, t, external_cond=None, last_only=False):
+    def forward(self, x, t, external_cond=None, last_only=False, last_frame=False):
         """
         Forward pass of DiT.
         x: (B, T, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (B, T,) tensor of diffusion timesteps
-        """
-        print(f"{t=}")
-        
-        B, T, C, H, W = x.shape
+        """        
+        B, T, C, H, W = x.shape            
         
         # add spatial embeddings
         x = rearrange(x, "b t c h w -> (b t) c h w")
@@ -332,21 +330,21 @@ class DiT(nn.Module):
         x = rearrange(x, "(b t) h w d -> b t h w d", t=T)
         
         # embed noise steps
-        t = rearrange(t, "b t -> (b t)")
+        t = t.flatten()
         c = self.t_embedder(t)
         c = rearrange(c, "(b t) d -> b t d", t=T)
         if torch.is_tensor(external_cond):
             c += self.external_cond(external_cond)
-        
+            
         for block in self.blocks:
-            x = block(x, c)
+            x = block(x, c, last_frame=last_frame)
              
         x = self.final_layer(x, c)  # (N, T, H, W, patch_size ** 2 * out_channels)
                     
         # unpatchify
         x = rearrange(x, "b t h w d -> (b t) h w d")
         x = self.unpatchify(x)  # (N, out_channels, H, W)
-        x = rearrange(x, "(b t) c h w -> b t c h w", t=T)
+        x = rearrange(x, "(b t) c h w -> b t c h w", t=1 if self.streaming else T)
 
         if last_only:
             x = x[:, -1:].contiguous()
