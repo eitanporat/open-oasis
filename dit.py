@@ -199,7 +199,7 @@ class SpatioTemporalDiTBlock(nn.Module):
 
         # spatial block
         s_shift_msa, s_scale_msa, s_gate_msa, s_shift_mlp, s_scale_mlp, s_gate_mlp = self.s_adaLN_modulation(c).chunk(6, dim=-1)
-        x = x + gate(self.s_attn(modulate(self.s_norm1(x), s_shift_msa, s_scale_msa)), s_gate_msa)
+        x = x + gate(self.s_attn(modulate(self.s_norm1(x), s_shift_msa, s_scale_msa), last_frame=last_frame), s_gate_msa)
         x = x + gate(self.s_mlp(modulate(self.s_norm2(x), s_shift_mlp, s_scale_mlp)), s_gate_mlp)
 
         # temporal block
